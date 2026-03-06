@@ -1,3 +1,4 @@
+# sql_agent.py
 from dotenv import load_dotenv
 import os
 
@@ -15,25 +16,25 @@ from langgraph.prebuilt import ToolNode
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 
 # 加载 .env 文件
-load_dotenv(dotenv_path="C:/Users/uik03277/mine/code/.env")
+load_dotenv()
 
 
 # ===== 模型配置 =====
 chat_model = ChatOpenAI(
-    model="gemini-2.5-pro",
-    api_key=os.getenv("OPENAI_API_KEY"),  # 手动传入 API Key
-    base_url=os.getenv("LLMI_URL")
+    model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
+    api_key=os.getenv("OPENAI_API_KEY"),
+    base_url=os.getenv("OPENAI_BASE_URL")  # 可选，默认使用 OpenAI 官方地址
 )
 
 support_model = ChatOllama(
-    model="qwen3:0.6b",
+    model=os.getenv("OLLAMA_MODEL", "qwen3:0.6b"),
     temperature=0
 )
 
-# ===== 数据库连接（未处理表） =====
+# ===== 数据库连接 =====
 db = SQLDatabase.from_uri(
     f"postgresql+psycopg2://{os.getenv('POSTGRESQL_USERNAME')}:{os.getenv('POSTGRESQL_PASSWORD')}@{os.getenv('POSTGRESQL_HOST')}:{os.getenv('POSTGRESQL_PORT')}/{os.getenv('POSTGRESQL_DBNAME')}",
-    include_tables=["parameter_tables_parameter"]
+    include_tables=[os.getenv("DB_TABLE_NAME", "parameter_tables_parameter")]
 )
 
 toolkit = SQLDatabaseToolkit(db=db, llm=chat_model)
@@ -72,14 +73,14 @@ generate_query_system_prompt = (
     f"Then you should query the schema of the most relevant tables.\n"
 )
 
-# ===== 未处理表的真实字段 schema =====
+# ===== 表字段 schema 描述 =====
 table_schema = {
     'id': '唯一ID',
-    'carline': '车型项目，例如 E371, DX11 等',
-    'project': 'HCM 硬件版本',
-    'parameter_name': '原始参数名称，例如 pLedMaxVoltage#1',
-    'parameter_group': '参数所属分组，例如电压、电流、灯光功能配置等',
-    'data_type': '参数数据类型，例如 uint8, float',
+    'carline': '车型项目代号',
+    'project': '硬件版本',
+    'parameter_name': '原始参数名称',
+    'parameter_group': '参数所属分组',
+    'data_type': '参数数据类型',
     'size': '数据大小（字节数）',
     'min_value': '参数最小值',
     'max_value': '参数最大值',
@@ -87,9 +88,9 @@ table_schema = {
     'resolution': '参数分辨率',
     'dec_value': '参数小数位精度',
     'default_value': '参数默认值',
-    'unit': '参数单位，例如 V, mA, W',
+    'unit': '参数单位',
     'description': '参数描述或备注',
-    'excel_file_id': '来源 Excel 文件的 ID'
+    'excel_file_id': '来源文件的 ID'
 }
 
 search_instruction = (
@@ -168,3 +169,4 @@ builder.add_edge("check_query", "run_query")
 builder.add_edge("run_query", "generate_query")
 
 graph = builder.compile()
+
