@@ -1,0 +1,15 @@
+# LLM 配置
+OPENAI_API_KEY=your_api_key_here
+OPENAI_BASE_URL=https://api.openai.com/v1  # 可选，自定义 API 地址
+LLM_MODEL=gpt-4o-mini
+
+# Ollama 配置（可选）
+OLLAMA_MODEL=qwen3:0.6b
+
+# PostgreSQL 数据库配置
+POSTGRESQL_USERNAME=your_username
+POSTGRESQL_PASSWORD=your_password
+POSTGRESQL_HOST=localhost
+POSTGRESQL_PORT=5432
+POSTGRESQL_DBNAME=your_database
+DB_TABLE_NAME=your_table_name
