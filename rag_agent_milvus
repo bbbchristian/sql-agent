@@ -1,0 +1,254 @@
+# rag_agent_milvus.py
+import os
+import json
+from typing import List, TypedDict, Dict
+from dotenv import load_dotenv
+
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_milvus import Milvus
+from langchain_core.documents import Document
+from langgraph.graph import END, START, StateGraph
+
+# 加载环境变量
+load_dotenv()
+
+# 配置（从环境变量读取）
+API_KEY = os.getenv("OPENAI_API_KEY")
+BASE_URL = os.getenv("OPENAI_BASE_URL")
+MILVUS_URI = os.getenv("MILVUS_URI")
+COLLECTION_NAME = os.getenv("MILVUS_COLLECTION", "parameter_search")
+
+# LLM
+chat_model = ChatOpenAI(
+    model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
+    api_key=API_KEY,
+    base_url=BASE_URL
+)
+
+
+class State(TypedDict):
+    query: str
+    filters: Dict[str, str]
+    semantic_query: str
+    retrieved_docs: List[Document]
+    final_docs: List[Document]
+    response: str
+
+
+_vs = None
+
+
+def get_vectorstore():
+    """连接 Milvus 服务器"""
+    global _vs
+    if _vs is None:
+        embeddings = OpenAIEmbeddings(
+            model=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
+            api_key=API_KEY,
+            base_url=BASE_URL
+        )
+        _vs = Milvus(
+            embedding_function=embeddings,
+            collection_name=COLLECTION_NAME,
+            connection_args={"uri": MILVUS_URI},
+        )
+    return _vs
+
+
+def parse_query(state: State) -> State:
+    """解析查询，提取过滤条件"""
+    query = state["query"]
+    
+    prompt = f"""分析用户查询，提取：
+1. 精确过滤条件（如车型 carline、项目 project）
+2. 需要语义搜索的内容
+
+用户查询: {query}
+
+以 JSON 格式返回:
+{{"filters": {{"carline": "E371"}}, "semantic_query": "日间行车灯参数"}}
+
+如果没有过滤条件:
+{{"filters": {{}}, "semantic_query": "日间行车灯参数"}}
+
+只返回 JSON:"""
+    
+    resp = chat_model.invoke(prompt)
+    
+    try:
+        result = json.loads(resp.content.strip())
+        filters = result.get("filters", {})
+        semantic_query = result.get("semantic_query", query)
+    except:
+        filters = {}
+        semantic_query = query
+    
+    print(f"🔍 解析: filters={filters}, semantic_query={semantic_query}")
+    
+    return {**state, "filters": filters, "semantic_query": semantic_query}
+
+
+def retrieve(state: State) -> State:
+    """Milvus 混合搜索"""
+    vs = get_vectorstore()
+    semantic_query = state["semantic_query"]
+    filters = state.get("filters", {})
+    
+    # 构建 Milvus 过滤表达式
+    filter_expr = None
+    if filters:
+        filter_parts = []
+        for key, value in filters.items():
+            filter_parts.append(f'{key} == "{value}"')
+        filter_expr = " and ".join(filter_parts)
+        print(f"🔧 Milvus 过滤表达式: {filter_expr}")
+    
+    # Milvus 混合搜索
+    try:
+        if filter_expr:
+            docs = vs.similarity_search_with_score(
+                semantic_query, 
+                k=20,
+                expr=filter_expr
+            )
+        else:
+            docs = vs.similarity_search_with_score(semantic_query, k=20)
+    except Exception as e:
+        print(f"⚠️ 搜索出错: {e}")
+        docs = vs.similarity_search_with_score(semantic_query, k=20)
+    
+    retrieved = []
+    for doc, score in docs:
+        doc.metadata["score"] = round(float(score), 4)
+        retrieved.append(doc)
+    
+    print(f"📋 检索到 {len(retrieved)} 条结果")
+    
+    return {**state, "retrieved_docs": retrieved}
+
+
+def rerank(state: State) -> State:
+    """LLM 重排，选 top-10"""
+    docs = state["retrieved_docs"]
+    query = state["query"]
+    
+    if len(docs) <= 10:
+        return {**state, "final_docs": docs}
+    
+    candidates = "\n".join([
+        f"[{i}] {doc.page_content[:300]}" for i, doc in enumerate(docs)
+    ])
+    
+    prompt = f"""根据用户查询，选出最相关的10条记录。
+
+用户查询: {query}
+
+候选记录:
+{candidates}
+
+返回10个最相关的编号，用逗号分隔:"""
+    
+    resp = chat_model.invoke(prompt)
+    
+    try:
+        indices = [int(x.strip()) for x in resp.content.strip().split(",")][:10]
+        final = [docs[i] for i in indices if i < len(docs)]
+    except:
+        final = docs[:10]
+    
+    return {**state, "final_docs": final}
+
+
+def format_output(state: State) -> State:
+    """格式化输出"""
+    docs = state["final_docs"]
+    query = state["query"]
+    filters = state.get("filters", {})
+    
+    if not docs:
+        return {**state, "response": "❌ 未找到相关结果"}
+    
+    lines = [f"🔍 **查询:** {query}"]
+    
+    if filters:
+        lines.append(f"🔧 **过滤条件:** {filters}")
+    
+    lines.append(f"📋 **找到 {len(docs)} 条结果:**\n")
+    
+    for i, doc in enumerate(docs, 1):
+        lines.append(f"{'='*50}")
+        lines.append(f"**结果 {i}** (分数: {doc.metadata.get('score', 'N/A')})")
+        lines.append(f"**车型 (carline):** {doc.metadata.get('carline', 'N/A')}")
+        lines.append(f"**项目 (project):** {doc.metadata.get('project', 'N/A')}")
+        lines.append(f"**通道 (channel_name):** {doc.metadata.get('channel_name', 'N/A')}")
+        lines.append(f"**描述 (description):** {doc.metadata.get('description', 'N/A')}")
+        
+        lines.append(f"\n**其他字段:**")
+        skip_fields = ['row_index', 'score', 'description', 'carline', 'project', 'channel_name']
+        for key, value in doc.metadata.items():
+            if key not in skip_fields and value:
+                lines.append(f"  - {key}: {value}")
+        
+        row_index = doc.metadata.get('row_index', 'N/A')
+        if row_index != 'N/A':
+            excel_row = int(row_index) + 2
+            lines.append(f"\n📍 数据库行号: {row_index} | Excel 行号: {excel_row}\n")
+    
+    return {**state, "response": "\n".join(lines)}
+
+
+# 构建 Graph
+builder = StateGraph(State)
+
+builder.add_node("parse_query", parse_query)
+builder.add_node("retrieve", retrieve)
+builder.add_node("rerank", rerank)
+builder.add_node("format_output", format_output)
+
+builder.add_edge(START, "parse_query")
+builder.add_edge("parse_query", "retrieve")
+builder.add_edge("retrieve", "rerank")
+builder.add_edge("rerank", "format_output")
+builder.add_edge("format_output", END)
+
+graph = builder.compile()
+
+
+def search(query: str) -> str:
+    result = graph.invoke({
+        "query": query,
+        "filters": {},
+        "semantic_query": "",
+        "retrieved_docs": [],
+        "final_docs": [],
+        "response": ""
+    })
+    return result["response"]
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("🤖 RAG Agent (Milvus 混合搜索)")
+    print(f"📡 Milvus: {MILVUS_URI}")
+    print("=" * 60)
+    print("示例查询:")
+    print("  - E371 日间行车灯")
+    print("  - DX11 转向灯参数")
+    print("  - 日间行车灯（不限车型）")
+    print("输入 'quit' 退出")
+    print("=" * 60)
+    
+    while True:
+        query = input("\n🔍 请输入查询: ").strip()
+        
+        if query.lower() in ['quit', 'exit', 'q']:
+            print("👋 再见！")
+            break
+        
+        if not query:
+            print("⚠️ 请输入有效内容")
+            continue
+        
+        print("\n⏳ 搜索中...\n")
+        result = search(query)
+        print(result)
